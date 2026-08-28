@@ -346,10 +346,9 @@ pub(crate) struct HelmSearchChartsArgs {
 // root is always `<data_dir>/charts`.
 // ---------------------------------------------------------------------------
 
-/// The on-disk root of the local chart library for this CoreState.
-fn local_chart_root(mgr: &CoreState) -> std::path::PathBuf {
-    mgr.data_dir.join("charts")
-}
+// The local chart library root for every command below is
+// `local::charts_dir(&mgr.data_dir)` — `<data_dir>/charts`, the same path
+// the MCP server uses.
 
 /// Wire arguments for [`local_chart_detail`] (camelCase on the wire).
 #[derive(serde::Deserialize)]
@@ -417,7 +416,7 @@ pub(crate) struct LocalChartDepsArgs {
 pub fn local_charts_list_impl(
     mgr: std::sync::Arc<CoreState>,
 ) -> AppResult<Vec<local::LocalChartEntry>> {
-    local::scan_local_charts(&local_chart_root(&mgr))
+    local::scan_local_charts(&local::charts_dir(&mgr.data_dir))
 }
 
 /// One chart's detail view: entry + file tree + rendered README/values.
@@ -425,7 +424,7 @@ pub fn local_chart_detail_impl(
     mgr: std::sync::Arc<CoreState>,
     id: String,
 ) -> AppResult<local::LocalChartDetail> {
-    local::local_chart_detail(&local_chart_root(&mgr), &id)
+    local::local_chart_detail(&local::charts_dir(&mgr.data_dir), &id)
 }
 
 /// Read one file out of a chart (tgz member or dir-chart file) as UTF-8.
@@ -434,12 +433,12 @@ pub fn local_chart_file_impl(
     id: String,
     path: String,
 ) -> AppResult<String> {
-    local::local_chart_file(&local_chart_root(&mgr), &id, &path)
+    local::local_chart_file(&local::charts_dir(&mgr.data_dir), &id, &path)
 }
 
-/// Import a chart package from base64 content. Audited: chart imports add
-/// bytes to the user's disk, so they land in the audit trail like every
-/// other mutating helm operation.
+/// Import a chart package from base64 content. Auditing lives in
+/// `local::import_chart_bytes` (k7s-core, success-only) so MCP imports are
+/// recorded the same way.
 pub fn local_chart_import_content_impl(
     mgr: std::sync::Arc<CoreState>,
     filename: String,
@@ -449,26 +448,13 @@ pub fn local_chart_import_content_impl(
     let bytes = k7s_deps::base64::engine::general_purpose::STANDARD
         .decode(&content_base64)
         .map_err(|e| AppError::Other(format!("bad base64: {e}")))?;
-    let entry = local::import_chart_bytes(&local_chart_root(&mgr), &filename, &bytes)?;
-    k7s_core::core::audit::record(
-        "local_chart_import",
-        k7s_deps::serde_json::json!({
-            "name": entry.name,
-            "version": entry.version,
-            "bytes": bytes.len(),
-        }),
-    );
-    Ok(entry)
+    local::import_chart_bytes(&local::charts_dir(&mgr.data_dir), &filename, &bytes)
 }
 
-/// Delete a chart from the library. Audited — same reason as import.
+/// Delete a chart from the library. Auditing lives in
+/// `local::remove_chart` (k7s-core, success-only).
 pub fn local_chart_remove_impl(mgr: std::sync::Arc<CoreState>, id: String) -> AppResult<()> {
-    local::remove_chart(&local_chart_root(&mgr), &id)?;
-    k7s_core::core::audit::record(
-        "local_chart_remove",
-        k7s_deps::serde_json::json!({ "id": id }),
-    );
-    Ok(())
+    local::remove_chart(&local::charts_dir(&mgr.data_dir), &id)
 }
 
 /// `helm lint` a chart from the local library, returning the report.
@@ -477,7 +463,7 @@ pub async fn local_chart_lint_impl(
     mgr: std::sync::Arc<CoreState>,
     id: String,
 ) -> AppResult<String> {
-    local::lint_chart(&local_chart_root(&mgr), &id).await
+    local::lint_chart(&local::charts_dir(&mgr.data_dir), &id).await
 }
 
 /// `helm verify` a chart from the local library, returning the report.
@@ -486,45 +472,29 @@ pub async fn local_chart_verify_impl(
     mgr: std::sync::Arc<CoreState>,
     id: String,
 ) -> AppResult<String> {
-    local::verify_chart(&local_chart_root(&mgr), &id).await
+    local::verify_chart(&local::charts_dir(&mgr.data_dir), &id).await
 }
 
 /// `helm package` an unpacked dir chart from the library, returning the
-/// fresh archive's entry. Audited: packaging writes a new `.tgz` to the
-/// library root, like import/remove.
+/// fresh archive's entry. Auditing lives in `local::package_chart`
+/// (k7s-core, success-only) so MCP packages are recorded too.
 pub async fn local_chart_package_impl(
     mgr: std::sync::Arc<CoreState>,
     id: String,
 ) -> AppResult<local::LocalChartEntry> {
-    let entry = local::package_chart(&local_chart_root(&mgr), &id).await?;
-    k7s_core::core::audit::record(
-        "local_chart_package",
-        k7s_deps::serde_json::json!({
-            "id": id,
-            "name": entry.name,
-            "version": entry.version,
-        }),
-    );
-    Ok(entry)
+    local::package_chart(&local::charts_dir(&mgr.data_dir), &id).await
 }
 
 /// `helm dependency list|build|update` on a chart from the library.
-/// `List` is read-only — no audit; `Build`/`Update` write Chart.lock and
-/// the charts/ cache inside the chart dir, so they land in the audit trail
-/// with the serialized lowercase action.
+/// `List` is read-only — no audit; `Build`/`Update` are audited in
+/// `local::chart_deps` (k7s-core, success-only) so MCP deps writes are
+/// recorded too.
 pub async fn local_chart_deps_impl(
     mgr: std::sync::Arc<CoreState>,
     id: String,
     action: local::DepsAction,
 ) -> AppResult<String> {
-    let out = local::chart_deps(&local_chart_root(&mgr), &id, action).await?;
-    if !matches!(action, local::DepsAction::List) {
-        k7s_core::core::audit::record(
-            "local_chart_deps",
-            k7s_deps::serde_json::json!({ "id": id, "action": action }),
-        );
-    }
-    Ok(out)
+    local::chart_deps(&local::charts_dir(&mgr.data_dir), &id, action).await
 }
 
 #[cfg(feature = "ipc")]
