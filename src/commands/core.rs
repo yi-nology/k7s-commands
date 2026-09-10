@@ -202,10 +202,14 @@ pub async fn connect_impl(
     let manager: Arc<ClientManager> = mgr.manager.clone();
 
     // Shared connection sequence: reset -> build client -> probe version ->
-    // discover CRDs. The Tauri shell reads `import_path`; kubeconfig-bytes
-    // is not used here (files live on disk).
+    // discover CRDs. Web-shell imports carry their parsed kubeconfig in the
+    // manager (no file exists on disk — the bytes came from the browser), so
+    // they must be passed through or connect would try to read the pasted
+    // filename as a path. Tauri imports keep `kubeconfig: None` there and are
+    // re-read via `import_path`. connect_core prefers the parsed config.
+    let imported = manager.import_kubeconfig(&context).await;
     let import_path = manager.import_path(&context).await;
-    let cr = shell_common::connect_core(&manager, None, import_path, &context).await?;
+    let cr = shell_common::connect_core(&manager, imported, import_path, &context).await?;
 
     // Start watchers for all kinds and register their tasks.
     let watcher_count = watchers::spawn_all(&manager, cr.client.clone()).await;
