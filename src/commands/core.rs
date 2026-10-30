@@ -214,7 +214,7 @@ pub async fn connect_impl(
     // Start watchers for all kinds and register their tasks.
     let watcher_count = watchers::spawn_all(&manager, cr.client.clone()).await;
 
-    // Start the metrics + status pollers and register them too.
+    // Read prefs before tying the connection down: this step can still fail.
     // Poll intervals come from the user's settings (B23). Read at connect, so a
     // change takes effect on the next connection rather than restarting live
     // pollers for a value measured in seconds.
@@ -223,17 +223,10 @@ pub async fn connect_impl(
         .await
         .map_err(|e| AppError::Other(e.to_string()))?;
     let pi = prefs::poll_intervals(&prefs);
-    let (metrics_task, status_task) = metrics::spawn_pollers(manager.sink(), cr.client.clone(), pi);
-    manager.push_task(metrics_task).await;
-    manager.push_task(status_task).await;
 
-    // Tell the frontend about CRD-backed kinds (discovered inside connect_core).
-    manager
-        .sink()
-        .emit(k7s_core::kube::events::CUSTOM_KINDS, &cr.custom_kinds);
-
-    // Record the live connection with the real watcher count.
-    manager
+    // Record the connection; its epoch is the front-end's handle for
+    // rejecting writes made from a page bound to an earlier connection.
+    let connection_epoch = manager
         .set_connected(
             cr.client.clone(),
             k7s_core::kube::manager::ConnectionInfo {
@@ -244,6 +237,23 @@ pub async fn connect_impl(
             watcher_count,
         )
         .await;
+
+    // Spawn the pollers after set_connected so every status carries this
+    // connection's tag.
+    let (metrics_task, status_task) = metrics::spawn_pollers(
+        manager.sink(),
+        cr.client.clone(),
+        pi,
+        context.clone(),
+        connection_epoch,
+    );
+    manager.push_task(metrics_task).await;
+    manager.push_task(status_task).await;
+
+    // Tell the frontend about CRD-backed kinds (discovered inside connect_core).
+    manager
+        .sink()
+        .emit(k7s_core::kube::events::CUSTOM_KINDS, &cr.custom_kinds);
 
     // Auto-sync knowledge from the cluster (ConfigMaps, pod annotations)
     // in the background. Non-blocking — the connect response returns
@@ -282,6 +292,7 @@ pub async fn connect_impl(
         cluster_name: context,
         server: cr.server,
         version: cr.version,
+        connection_epoch,
     })
 }
 
@@ -333,6 +344,9 @@ pub(crate) struct ApplyYamlArgs {
     pub namespace: String,
     pub name: String,
     pub yaml: String,
+    /// Caller's connection epoch (`None` skips the guard: desktop IPC, older clients).
+    #[serde(default)]
+    pub connection_epoch: Option<u64>,
 }
 
 pub async fn apply_yaml_impl(
@@ -341,8 +355,10 @@ pub async fn apply_yaml_impl(
     namespace: String,
     name: String,
     yaml: String,
+    connection_epoch: Option<u64>,
 ) -> AppResult<()> {
     let client = require_client(&mgr.manager).await?;
+    ensure_connection_epoch(&mgr.manager, connection_epoch).await?;
     shell_common::apply_yaml_core(client, &kind, &namespace, &name, &yaml, &mgr.manager).await
 }
 
@@ -355,7 +371,7 @@ pub async fn apply_yaml(
     yaml: String,
     mgr: State<'_, Arc<CoreState>>,
 ) -> AppResult<()> {
-    apply_yaml_impl(mgr.inner().clone(), kind, namespace, name, yaml).await
+    apply_yaml_impl(mgr.inner().clone(), kind, namespace, name, yaml, None).await
 }
 
 /// Send an edit as a server-side dry run and return both sides for a diff (B36).
@@ -376,6 +392,9 @@ pub(crate) struct DryRunYamlArgs {
     pub namespace: String,
     pub name: String,
     pub yaml: String,
+    /// Caller's connection epoch (`None` skips the guard).
+    #[serde(default)]
+    pub connection_epoch: Option<u64>,
 }
 
 pub async fn dry_run_yaml_impl(
@@ -384,8 +403,10 @@ pub async fn dry_run_yaml_impl(
     namespace: String,
     name: String,
     yaml: String,
+    connection_epoch: Option<u64>,
 ) -> AppResult<shell_common::YamlDiff> {
     let client = require_client(&mgr.manager).await?;
+    ensure_connection_epoch(&mgr.manager, connection_epoch).await?;
     shell_common::dry_run_yaml_core(client, &kind, &namespace, &name, &yaml, &mgr.manager).await
 }
 
@@ -398,7 +419,7 @@ pub async fn dry_run_yaml(
     yaml: String,
     mgr: State<'_, Arc<CoreState>>,
 ) -> AppResult<shell_common::YamlDiff> {
-    dry_run_yaml_impl(mgr.inner().clone(), kind, namespace, name, yaml).await
+    dry_run_yaml_impl(mgr.inner().clone(), kind, namespace, name, yaml, None).await
 }
 
 /// Delete a resource of any kind. The frontend confirms first; API errors are
@@ -410,6 +431,9 @@ pub(crate) struct DeleteResourceArgs {
     pub kind: String,
     pub namespace: String,
     pub name: String,
+    /// Caller's connection epoch (`None` skips the guard).
+    #[serde(default)]
+    pub connection_epoch: Option<u64>,
 }
 
 pub async fn delete_resource_impl(
@@ -417,8 +441,10 @@ pub async fn delete_resource_impl(
     kind: String,
     namespace: String,
     name: String,
+    connection_epoch: Option<u64>,
 ) -> AppResult<()> {
     let client = require_client(&mgr.manager).await?;
+    ensure_connection_epoch(&mgr.manager, connection_epoch).await?;
     shell_common::delete_resource_core(client, &kind, &namespace, &name, &mgr.manager).await
 }
 
@@ -430,7 +456,7 @@ pub async fn delete_resource(
     name: String,
     mgr: State<'_, Arc<CoreState>>,
 ) -> AppResult<()> {
-    delete_resource_impl(mgr.inner().clone(), kind, namespace, name).await
+    delete_resource_impl(mgr.inner().clone(), kind, namespace, name, None).await
 }
 
 /// Scale a Deployment/StatefulSet by patching `spec.replicas`.
@@ -442,6 +468,9 @@ pub(crate) struct ScaleResourceArgs {
     pub namespace: String,
     pub name: String,
     pub replicas: i32,
+    /// Caller's connection epoch (`None` skips the guard).
+    #[serde(default)]
+    pub connection_epoch: Option<u64>,
 }
 
 pub async fn scale_resource_impl(
@@ -450,8 +479,10 @@ pub async fn scale_resource_impl(
     namespace: String,
     name: String,
     replicas: i32,
+    connection_epoch: Option<u64>,
 ) -> AppResult<()> {
     let client = require_client(&mgr.manager).await?;
+    ensure_connection_epoch(&mgr.manager, connection_epoch).await?;
     shell_common::scale_resource_core(client, &kind, &namespace, &name, replicas, &mgr.manager)
         .await
 }
@@ -465,7 +496,7 @@ pub async fn scale_resource(
     replicas: i32,
     mgr: State<'_, Arc<CoreState>>,
 ) -> AppResult<()> {
-    scale_resource_impl(mgr.inner().clone(), kind, namespace, name, replicas).await
+    scale_resource_impl(mgr.inner().clone(), kind, namespace, name, replicas, None).await
 }
 
 /// Cordon or uncordon a node by patching `spec.unschedulable`.
@@ -1422,6 +1453,33 @@ pub(crate) async fn require_client(mgr: &ClientManager) -> AppResult<k7s_deps::k
     mgr.client()
         .await
         .ok_or_else(|| AppError::NotFound("not connected to a cluster".into()))
+}
+
+/// Reject a mutation prepared under a different connection.
+///
+/// k7s-web shares one `ClientManager` per process, so another session's
+/// `connect` re-points every session's writes; without this check an edit from
+/// a stale page silently lands on the new cluster (same-named objects make it
+/// succeed). `None` — desktop IPC, older clients — skips the check.
+pub(crate) async fn ensure_connection_epoch(
+    mgr: &ClientManager,
+    expected: Option<u64>,
+) -> AppResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let current = mgr.connection_epoch().await;
+    if current == expected {
+        return Ok(());
+    }
+    let context = mgr
+        .connection_info()
+        .await
+        .map(|info| info.context)
+        .unwrap_or_else(|| "<disconnected>".to_string());
+    Err(AppError::Conflict(format!(
+        "集群已切换（当前 {context} #{current}，请求 #{expected}），请刷新重试"
+    )))
 }
 
 /// Best "last seen" time for sorting: last_timestamp, else event_time, else epoch.
