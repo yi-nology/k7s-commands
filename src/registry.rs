@@ -58,25 +58,56 @@ pub fn build_registry() -> CommandRegistry {
     r.register(
         "apply_yaml",
         |mgr, a: commands::core::ApplyYamlArgs| async move {
-            commands::core::apply_yaml_impl(mgr, a.kind, a.namespace, a.name, a.yaml).await
+            commands::core::apply_yaml_impl(
+                mgr,
+                a.kind,
+                a.namespace,
+                a.name,
+                a.yaml,
+                a.connection_epoch,
+            )
+            .await
         },
     );
     r.register(
         "dry_run_yaml",
         |mgr, a: commands::core::DryRunYamlArgs| async move {
-            commands::core::dry_run_yaml_impl(mgr, a.kind, a.namespace, a.name, a.yaml).await
+            commands::core::dry_run_yaml_impl(
+                mgr,
+                a.kind,
+                a.namespace,
+                a.name,
+                a.yaml,
+                a.connection_epoch,
+            )
+            .await
         },
     );
     r.register(
         "delete_resource",
         |mgr, a: commands::core::DeleteResourceArgs| async move {
-            commands::core::delete_resource_impl(mgr, a.kind, a.namespace, a.name).await
+            commands::core::delete_resource_impl(
+                mgr,
+                a.kind,
+                a.namespace,
+                a.name,
+                a.connection_epoch,
+            )
+            .await
         },
     );
     r.register(
         "scale_resource",
         |mgr, a: commands::core::ScaleResourceArgs| async move {
-            commands::core::scale_resource_impl(mgr, a.kind, a.namespace, a.name, a.replicas).await
+            commands::core::scale_resource_impl(
+                mgr,
+                a.kind,
+                a.namespace,
+                a.name,
+                a.replicas,
+                a.connection_epoch,
+            )
+            .await
         },
     );
     r.register(
